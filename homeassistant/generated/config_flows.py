@@ -610,6 +610,7 @@ FLOWS = {
         "vulcan",
         "wallbox",
         "waqi",
+        "watersmart",
         "watttime",
         "waze_travel_time",
         "weatherflow",

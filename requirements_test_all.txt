@@ -475,6 +475,7 @@ babel==2.15.0
 base36==0.1.1
 
 # homeassistant.components.scrape
+# homeassistant.components.watersmart
 beautifulsoup4==4.12.3
 
 # homeassistant.components.zha
