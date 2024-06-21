@@ -90,9 +90,9 @@ def _get_device_info(hostname: str, username: str) -> DeviceInfo:
 
 
 def _from_timestamp(timestamp: int):
-    result = dt.datetime.fromtimestamp(timestamp)
-    result.replace(tzinfo=get_default_time_zone())
-    return result
+    return dt.datetime.fromtimestamp(timestamp, tz=dt.UTC).replace(
+        tzinfo=get_default_time_zone()
+    )
 
 
 def _data_converter(key: str):
@@ -163,7 +163,7 @@ def _records_from_first_full_day(data):
             full_day_records.append(record)
             last_full_day = start_of_day
 
-    return full_day_records
+    return list(reversed(full_day_records))
 
 
 def _records_for_attrs(records: list[dict[str, Any]]) -> list[dict[str, Any]]:

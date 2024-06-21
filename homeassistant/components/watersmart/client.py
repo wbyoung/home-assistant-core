@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import datetime as dt
 import functools
 import re
 
@@ -44,7 +45,7 @@ class WaterSmartClient:
         self._password = password
         self._session = session or aiohttp.ClientSession()
         self._account_number = None
-        self._authenticated = False
+        self._authenticated_at = None
 
     @_authenticated
     async def async_get_account_number(self) -> str:
@@ -67,9 +68,12 @@ class WaterSmartClient:
         return data["series"]
 
     async def _authenticate_if_needed(self) -> None:
-        if not self._authenticated:
+        if (
+            not self._authenticated_at
+            or self._authenticated_at < dt.datetime.now() - dt.timedelta(minutes=10)
+        ):
             await self._authenticate()
-        self._authenticated = True
+        self._authenticated_at = dt.datetime.now()
 
     async def _authenticate(self) -> None:
         session = self._session
