@@ -4,11 +4,12 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
-import datetime as dt
+import logging
 from typing import Any
 
 from yalexs_ble import ConnectionInfo, DoorActivity, LockActivity, LockInfo, LockState
 
+from homeassistant.components.recorder import get_instance as get_recorder_instance
 from homeassistant.components.sensor import (
     SensorDeviceClass,
     SensorEntity,
@@ -16,18 +17,37 @@ from homeassistant.components.sensor import (
     SensorStateClass,
 )
 from homeassistant.const import (
+    EVENT_STATE_CHANGED,
     PERCENTAGE,
     SIGNAL_STRENGTH_DECIBELS_MILLIWATT,
+    STATE_UNAVAILABLE,
     EntityCategory,
     UnitOfElectricPotential,
 )
-from homeassistant.core import HomeAssistant, callback
+from homeassistant.core import (
+    CALLBACK_TYPE,
+    Event,
+    EventStateChangedData,
+    HomeAssistant,
+    State,
+    callback,
+)
+from homeassistant.helpers import event as evt
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
+from homeassistant.util import dt as dt_util
 
 from . import YALEXSBLEConfigEntry
-from .const import ATTR_REMOTE_TYPE, ATTR_SLOT, ATTR_SOURCE, ATTR_TIMESTAMP
+from .const import (
+    ATTR_REMOTE_TYPE,
+    ATTR_SLOT,
+    ATTR_SOURCE,
+    ATTR_TIMESTAMP,
+    OPERATION_SENSOR_WRITE_DELAY,
+)
 from .entity import YALEXSBLEEntity
 from .models import YaleXSBLEData
+
+_LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -96,10 +116,8 @@ class YaleXSBLEOperationSensor(YALEXSBLEEntity, SensorEntity):
 
     _attr_translation_key = "operation"
     _attr_icon = "mdi:lock-clock"
-    _attr_timestamp: dt.datetime | None = None
-    _attr_source: str | None = None
-    _attr_remote_type: str | None = None
-    _attr_slot: int | None = None
+    _pending_activity_update: DoorActivity | LockActivity | None = None
+    _cancel_pending_activity_update: CALLBACK_TYPE | None = None
 
     def __init__(
         self,
@@ -118,43 +136,92 @@ class YaleXSBLEOperationSensor(YALEXSBLEEntity, SensorEntity):
     ) -> None:
         """Handle activity update."""
 
-        self._attr_native_value = None
-        self._attr_timestamp = None
-        self._attr_source = None
-        self._attr_remote_type = None
-        self._attr_slot = None
+        value, attributes = self._extract_values(activity)
 
-        if isinstance(activity, DoorActivity):
-            self._attr_native_value = f"door_{activity.status.name.lower()}"
-            self._attr_timestamp = activity.timestamp
-        elif isinstance(activity, LockActivity):
-            self._attr_native_value = f"lock_{activity.status.name.lower()}"
-            self._attr_timestamp = activity.timestamp
-            self._attr_source = activity.source.name.lower()
-            self._attr_remote_type = (
-                activity.remote_type.name.lower()
-                if activity.remote_type is not None
-                else None
-            )
-            self._attr_slot = activity.slot if activity.slot is not None else None
+        _LOGGER.debug("creating event for activity update")
+
+        self.hass.bus.async_fire(
+            "yalexs_ble.activity",
+            {
+                "state": value,
+                "attributes": attributes,
+            },
+        )
+
+        if self._pending_activity_update:
+            self._record_pending_update()
+
+        self._pending_activity_update = activity
+
+        if self._cancel_pending_activity_update:
+            self._cancel_pending_activity_update()
+
+        self._cancel_pending_activity_update = evt.async_call_later(
+            self.hass,
+            OPERATION_SENSOR_WRITE_DELAY,
+            self._flush_pending_update,
+        )
+
+    def _record_pending_update(self) -> None:
+        if not (activity := self._pending_activity_update):
+            return
+
+        native_value, attributes = self._extract_values(activity)
+        # now = dt_util.now()
+        # timestamp = dt_util.as_timestamp(now)
+
+        state_changed_data: EventStateChangedData = {
+            "entity_id": self.entity_id,
+            "old_state": None,
+            "new_state": State(
+                self.entity_id,
+                native_value or STATE_UNAVAILABLE,
+                attributes,
+                last_changed=activity.timestamp,
+                last_reported=activity.timestamp,
+                last_updated=activity.timestamp,
+                last_updated_timestamp=dt_util.as_timestamp(activity.timestamp),
+            ),
+        }
+
+        _LOGGER.debug("writing historic activity update: %s", state_changed_data)
+
+        instance = get_recorder_instance(self.hass)
+        instance.queue_task(Event(str(EVENT_STATE_CHANGED), state_changed_data))
+
+    @callback
+    def _flush_pending_update(self, now: Any) -> None:
+        if not (activity := self._pending_activity_update):
+            return
+
+        _LOGGER.debug("flushing pending activity update")
+
+        self._attr_native_value, self._attr_extra_state_attributes = (
+            self._extract_values(activity)
+        )
+        self._pending_activity_update = None
 
         self.async_write_ha_state()
 
-    @property
-    def extra_state_attributes(self) -> dict[str, Any]:
-        """Return the device specific state attributes."""
+    def _extract_values(
+        self, activity: DoorActivity | LockActivity
+    ) -> tuple[str | None, dict[str, Any]]:
+        value: str | None = None
         attributes: dict[str, Any] = {}
 
-        if self._attr_timestamp is not None:
-            attributes[ATTR_TIMESTAMP] = self._attr_timestamp
-        if self._attr_source is not None:
-            attributes[ATTR_SOURCE] = self._attr_source
-        if self._attr_remote_type is not None:
-            attributes[ATTR_REMOTE_TYPE] = self._attr_remote_type
-        if self._attr_slot is not None:
-            attributes[ATTR_SLOT] = self._attr_slot
+        if isinstance(activity, DoorActivity):
+            value = f"door_{activity.status.name.lower()}"
+            attributes[ATTR_TIMESTAMP] = activity.timestamp
+        elif isinstance(activity, LockActivity):
+            value = f"lock_{activity.status.name.lower()}"
+            attributes[ATTR_TIMESTAMP] = activity.timestamp
+            attributes[ATTR_SOURCE] = activity.source.name.lower()
+            if activity.remote_type is not None:
+                attributes[ATTR_REMOTE_TYPE] = activity.remote_type.name.lower()
+            if activity.slot is not None:
+                attributes[ATTR_SLOT] = activity.slot
 
-        return attributes
+        return (value, attributes)
 
     async def async_added_to_hass(self) -> None:
         """Register callbacks & perform initial updates."""
